@@ -94,6 +94,7 @@ impl JarRemapper {
         Self::replace_regex_matches_from_map(&mut buf, r"field_\d+_[[:alpha:]]+", &self.mappings.fields);
         Self::replace_regex_matches_from_map(&mut buf, r"func_\d+_[[:alpha:]]+", &self.mappings.methods);
         Self::replace_regex_matches_from_map(&mut buf, r"p_\d+_\d+_", &self.mappings.params);
+        outfile.write(buf.as_bytes());
     }
 
     fn replace_regex_matches_from_map(buf: &mut String, regex: &str, map: &HashMap<String, String>){
@@ -117,6 +118,7 @@ impl JarRemapper {
         if let Some(last_match) = matches.last(){
             out.push_str(&buf.as_str()[last_match.end()+1..]);
         }
+        buf.clone_from(&out);
     }
 }
 
