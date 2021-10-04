@@ -1,78 +1,75 @@
 use std::fs;
 use std::io::{self, prelude::*};
-use std::collections::{hash_map, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use zip::read::ZipFile;
-use zip::result::ZipResult;
-use regex::{Match, Regex};
+use regex::Regex;
 
-struct Mappings{
-    fields: hash_map::HashMap<String, String>,
-    methods: hash_map::HashMap<String, String>,
-    params: hash_map::HashMap<String, String>
-}
+fn get_mapping(file: &fs::File) -> Result<HashMap<String, String>,()>{
+    let mut archive = match zip::ZipArchive::new(file){
+        Ok(v) => {v}
+        Err(_) => {return Err(());}
+    };
 
-impl Mappings{
-	fn new(file: &fs::File) -> Option<Self>{
-        let mut archive = match zip::ZipArchive::new(file){
-            Ok(v) => {v}
-            Err(_) => {return None;}
-        };
+    let mut mapping = HashMap::<String, String>::new();
 
-        let mut fields  = (HashMap::<String, String>::new(), "fields.csv");
-        let mut params  = (HashMap::<String, String>::new(), "params.csv");
-        let mut methods = (HashMap::<String, String>::new(), "methods.csv");
-
-        for entry in vec![&mut fields, &mut params, &mut methods].iter_mut(){
-            if let Ok(mut file) = archive.by_name(entry.1){
-                if let Err(()) = Self::fill_mapping(&mut entry.0, &mut file){
-                    return None;
-                }
-            }
-        }
-
-        Some(Self{fields: fields.0, params: params.0, methods: methods.0})
-	}
-
-    fn fill_mapping(map: &mut HashMap<String, String>, file: &mut ZipFile) -> Result<(), ()>{
-        let reader = io::BufReader::new(file);
-        for line in reader.lines(){
-            let line = line.unwrap_or("".to_string());
-            let cols: Vec<&str> = line.split(",").collect();
-            let obf = cols.get(0);
-            let name = cols.get(1);
-            if obf.is_some() && name.is_some(){
-                map.insert(obf.unwrap().to_string(), name.unwrap().to_string());
-            }else{
+    for entry in vec!["fields.csv", "params.csv", "methods.csv"].iter_mut(){
+        if let Ok(mut file) = archive.by_name(entry){
+            if let Err(()) = fill_mapping(&mut mapping, &mut file){
                 return Err(());
             }
         }
-        Ok(())
     }
+
+    Ok(mapping)
+}
+
+fn fill_mapping(map: &mut HashMap<String, String>, file: &mut ZipFile) -> Result<(), ()>{
+    let reader = io::BufReader::new(file);
+    for (i, line) in reader.lines().enumerate(){
+        if i == 0{
+            continue;}
+        let line = line.unwrap_or("".to_string());
+        let cols: Vec<&str> = line.split(",").collect();
+        let obf = cols.get(0);
+        let name = cols.get(1);
+        if obf.is_some() && name.is_some(){
+            map.insert(obf.unwrap().to_string(), name.unwrap().to_string());
+        }
+    }
+    Ok(())
 }
 
 struct JarRemapper{
-    mappings: Mappings,
+    mappings: HashMap<String, String>,
 }
 
 impl JarRemapper {
-    fn new(mappings: Mappings) -> Self{
-        Self{mappings}
+    fn new(mappings: HashMap<String, String>) -> Self {
+        Self { mappings }
     }
 
-    fn remap_jar(&self, jar_name: &String) -> Result<(),String>{
-        let mut jar = fs::File::open(jar_name).expect("Couldn't open jar");
-        let mut archive = zip::ZipArchive::new(jar).expect("Couldn't read jar");
-        for i in 0..archive.len(){
+    fn remap_jar(&self, jar_name: &String) -> Result<(), String> {
+        let jar = match fs::File::open(jar_name) {
+            Ok(v) => {v}
+            Err(_) => {return Err(String::from("Couldn't open jar"))}
+        };
+        let mut archive = match zip::ZipArchive::new(jar){
+            Ok(v) => {v}
+            Err(_) => {return Err(String::from("Couldn't read jar"))}
+        };
+        let re = Regex::new(r"(field|func|p)_i*\d+_[a-zA-Z0-9]+_?").expect("Incorrect regex");
+
+        for i in 0..archive.len() {
             let mut file = archive.by_index(i).unwrap();
-            let mut outpath = match file.enclosed_name() {
+            let outpath = match file.enclosed_name() {
                 Some(path) => path.to_owned(),
                 None => continue,
             };
 
-            let outpath = match jar_name.find(".jar"){
-                None => {outpath}
-                Some(v) => {Path::new(&jar_name.as_str()[..v]).join(outpath)}
+            let outpath = match jar_name.find(".jar") {
+                None => { outpath }
+                Some(v) => { Path::new(&jar_name.as_str()[..v]).join(outpath) }
             };
 
             if (&*file.name()).ends_with('/') {
@@ -84,52 +81,48 @@ impl JarRemapper {
                     }
                 }
                 let mut outfile = fs::File::create(&outpath).unwrap();
-                self.remap_file(&mut file, &mut outfile);
+                self.remap_file(&mut file, &mut outfile, &re);
             }
         }
         return Ok(());
     }
 
-    fn remap_file(&self, file: &mut ZipFile, outfile: &mut fs::File){
-        if let Some(name) = file.enclosed_name(){
-            if !String::from(name.to_str().unwrap()).ends_with(".java"){
-                io::copy(file, outfile);
-                return;
-            }
-        }
-        let mut buf = String::new();
-        file.read_to_string(&mut buf);
-        Self::replace_regex_matches_from_map(&mut buf, r"field_\d+_[[:alpha:]]+", &self.mappings.fields);
-        Self::replace_regex_matches_from_map(&mut buf, r"func_\d+_[[:alpha:]]+_*", &self.mappings.methods);
-        Self::replace_regex_matches_from_map(&mut buf, r"p_\d+_\d+_", &self.mappings.params);
-        outfile.write(buf.as_bytes());
-    }
+    fn remap_file(&self, file: &mut ZipFile, outfile: &mut fs::File, re: &Regex) {
+        let name = match file.enclosed_name(){
+            Some(v) => {String::from(v.to_str().unwrap_or(""))}
+            None => {String::new()}
+        };
 
-    fn replace_regex_matches_from_map(buf: &mut String, regex: &str, map: &HashMap<String, String>){
-        let re = Regex::new(regex).expect("Incorrect regex");
-        let mut out = String::new();
-        let matches: Vec<_> = re.find_iter(buf.as_str()).collect();
-
-        if matches.len() == 0 {
+        if !name.ends_with(".java") {
+            io::copy(file, outfile);
             return;
         }
 
-        for (i, m) in matches.iter().enumerate(){
-            let start_before = if i>0 {
-                matches.get(i-1).unwrap().end()
-            }else{0};
+        let mut buf = String::new();
+        file.read_to_string(&mut buf);
+        let matches: Vec<_> = re.find_iter(buf.as_str()).collect();
+
+        if matches.len() == 0{
+            outfile.write(buf.as_bytes());
+            return;
+        }
+
+        for (i, m) in matches.iter().enumerate() {
+            let start_before = if i > 0 {
+                matches.get(i - 1).unwrap().end()
+            } else { 0 };
             let end_before = m.start();
-            out.push_str(&buf.as_str()[start_before..end_before]);
-            let name = match map.get(m.as_str()){
-                None => {m.as_str()}
-                Some(v) => {v.as_str()}
+            outfile.write(&buf.as_bytes()[start_before..end_before]);
+            let name = match self.mappings.get(m.as_str()) {
+                None => { m.as_str() }
+                Some(v) => { v.as_str() }
             };
-            out.push_str(name);
+            outfile.write(name.as_bytes());
         }
-        if let Some(last_match) = matches.last(){
-            out.push_str(&buf.as_str()[last_match.end()..]);
+
+        if let Some(last_match) = matches.last() {
+            outfile.write(&buf.as_bytes()[last_match.end()..]);
         }
-        buf.clone_from(&out);
     }
 }
 
@@ -140,9 +133,9 @@ fn main() {
         return;
     }
     let mappings = fs::File::open(args.get(1).unwrap()).expect("Couldn't open mappings file");
-    let mut jar = args.get(2).unwrap();
+    let jar = args.get(2).unwrap();
 
-    if let Some(mappings) = Mappings::new(&mappings){
+    if let Ok(mappings) = get_mapping(&mappings){
         let jar_remapper = JarRemapper::new(mappings);
         if let Err(e) = jar_remapper.remap_jar(jar){
             println!("{}", e);
